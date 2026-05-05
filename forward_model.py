@@ -81,7 +81,7 @@ def rhs(T, q_src, h, args):
     )
 
 
-def load_dataset(path):
+def load_dataset(path, skip_minutes=0.0):
     with h5py.File(path, "r") as f:
         T = np.asarray(f["T_history"], dtype=np.float32)
         t = np.asarray(f["time_vector"], dtype=np.float32).squeeze()
@@ -100,6 +100,20 @@ def load_dataset(path):
     t = t[valid][order] - t[valid][order][0]
     if q_history is not None:
         q_history = q_history[valid][order]
+
+    if skip_minutes < 0.0:
+        raise ValueError("--skip-minutes must be non-negative")
+    skip_seconds = 60.0 * skip_minutes
+    if skip_seconds > 0.0:
+        keep = t >= skip_seconds
+        if np.count_nonzero(keep) < 2:
+            raise ValueError(
+                f"--skip-minutes={skip_minutes:g} leaves fewer than 2 valid frames"
+            )
+        T = T[keep]
+        t = t[keep] - t[keep][0]
+        if q_history is not None:
+            q_history = q_history[keep]
     return T, t, x, y, q_history, params
 
 
@@ -109,6 +123,7 @@ def make_args(T, t, x, y, params):
     d_skin = 0.002
     rho_c = rho * C
     k = params.get("k", 0.6)
+    h_value = metadata_h_ground_truth(params)
     return {
         "dx": float(np.mean(np.diff(x))),
         "dy": float(np.mean(np.diff(y))),
@@ -118,7 +133,7 @@ def make_args(T, t, x, y, params):
         "M": T.shape[2],
         "D_T": k / rho_c,
         "T_amb": params.get("T_env_C", float(T[0].mean())),
-        "h": 0.0,
+        "h": h_value,
         "source_scale": rho_c * d_skin,
     }
 
@@ -153,10 +168,7 @@ def inverse_solve(
     log_every,
     viz_every,
     smooth_weight,
-    infer_h,
-    initial_h,
-    h_lr,
-    max_h,
+    fixed_h,
     q_history=None,
 ):
     solve_start = time.perf_counter()
@@ -166,14 +178,14 @@ def inverse_solve(
     if q_history is not None:
         q_ref = jax.device_put(jnp.asarray(np.mean(q_history, axis=0), dtype=dtype), device)
 
-    h0 = jnp.asarray(max(initial_h, 0.0), dtype=dtype)
-    params_opt = {"q_src": jnp.zeros_like(T_obs[0]), "h": h0}
+    h_fixed = jnp.asarray(fixed_h, dtype=dtype)
+    params_opt = {"q_src": jnp.zeros_like(T_obs[0])}
     optimizer = optax.adam(lr)
     opt_state = optimizer.init(params_opt)
 
     @jax.jit
     def loss_fn(params):
-        pred = forward_solve(T_obs[0], params["q_src"], params["h"], dts, args)
+        pred = forward_solve(T_obs[0], params["q_src"], h_fixed, dts, args)
         data_loss = jnp.mean((pred - T_obs) ** 2)
         q = params["q_src"]
         smooth = jnp.mean((q[1:, :] - q[:-1, :]) ** 2) + jnp.mean((q[:, 1:] - q[:, :-1]) ** 2)
@@ -182,14 +194,8 @@ def inverse_solve(
     @jax.jit
     def train_step(params, state):
         (loss, (data_loss, pred)), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
-        if not infer_h:
-            grads = {**grads, "h": jnp.zeros_like(grads["h"])}
         updates, state = optimizer.update(grads, state, params)
-        updates = {**updates, "h": updates["h"] * (h_lr / lr)}
         params = optax.apply_updates(params, updates)
-        params = {**params, "h": jnp.clip(params["h"], 0.0, max_h)}
-        if not infer_h:
-            params = {**params, "h": h0}
         return params, state, loss, data_loss, pred
 
     history = []
@@ -202,15 +208,13 @@ def inverse_solve(
     pred = None
     print(f"Using device: {device}")
     print(f"Fitting {T_obs.shape[0]} frames on a {T_obs.shape[1]}x{T_obs.shape[2]} grid")
-    print(f"{'Inferring' if infer_h else 'Using fixed'} h with initial value {float(h0):.6e}")
-    if infer_h:
-        print(f"h learning rate {h_lr:.2e}, h clamp [0, {max_h:.2e}]")
+    print(f"Using fixed h {float(h_fixed):.6e}; optimizer is only learning q_src(x, y)")
     if q_ref is not None:
         print("q_history diagnostics use the time-mean ground truth and are not used by the optimizer")
     for epoch in range(1, epochs + 1):
         params_opt, opt_state, loss, data_loss, pred = train_step(params_opt, opt_state)
         q_src = params_opt["q_src"]
-        h_value = params_opt["h"]
+        h_value = h_fixed
         take_snapshot = epoch == 1 or epoch % viz_every == 0 or epoch == epochs
         if take_snapshot:
             snapshot_epochs.append(epoch)
@@ -447,6 +451,134 @@ def save_parameter_ratio_plot(
     plt.close(fig)
 
 
+def relative_error(predicted, reference, eps=1e-8):
+    return (predicted - reference) / (np.abs(reference) + eps)
+
+
+Q_REL_ERROR_ABS_LIMIT = 1.0
+
+
+def save_final_comparison(path, q_src, pred, T_data, t_data, q_history):
+    if q_history is None:
+        return
+
+    T_pred = pred[-1]
+    T_ref = T_data[-1]
+    q_pred = q_src
+    q_ref = q_history[-1]
+    T_rel_error = relative_error(T_pred, T_ref)
+    q_rel_error = relative_error(q_pred, q_ref)
+
+    T_vmin = min(float(T_pred.min()), float(T_ref.min()))
+    T_vmax = max(float(T_pred.max()), float(T_ref.max()))
+    q_vmin = min(float(q_pred.min()), float(q_ref.min()))
+    q_vmax = max(float(q_pred.max()), float(q_ref.max()))
+    T_err_abs = float(np.max(np.abs(T_rel_error)))
+
+    fig, axes = plt.subplots(2, 3, figsize=(10, 6), dpi=180)
+    panels = [
+        (axes[0, 0], T_pred, "T pred", "inferno", {"vmin": T_vmin, "vmax": T_vmax}),
+        (axes[0, 1], T_ref, f"T ground truth, t={t_data[-1]:.1f}s", "inferno", {"vmin": T_vmin, "vmax": T_vmax}),
+        (axes[0, 2], T_rel_error, "T relative error", "coolwarm", {"vmin": -T_err_abs, "vmax": T_err_abs}),
+        (axes[1, 0], q_pred, "q pred steady", "coolwarm", {"vmin": q_vmin, "vmax": q_vmax}),
+        (axes[1, 1], q_ref, f"q ground truth transient, t={t_data[-1]:.1f}s", "coolwarm", {"vmin": q_vmin, "vmax": q_vmax}),
+        (axes[1, 2], q_rel_error, "q relative error", "coolwarm", {"vmin": -Q_REL_ERROR_ABS_LIMIT, "vmax": Q_REL_ERROR_ABS_LIMIT}),
+    ]
+    for axis, image, title, cmap, limits in panels:
+        im = axis.imshow(image, origin="lower", cmap=cmap, **limits)
+        fig.colorbar(im, ax=axis, fraction=0.046)
+        axis.set_title(title)
+    fig.tight_layout()
+    fig.savefig(path)
+    plt.close(fig)
+
+
+def save_time_comparison_animation(
+    path,
+    q_src,
+    pred,
+    T_data,
+    t_data,
+    q_history,
+    max_seconds=4.5,
+    max_frames=120,
+):
+    if q_history is None or len(pred) == 0:
+        return
+
+    idx = animation_indices(len(pred), max_frames)
+    T_pred = pred[idx]
+    T_ref = T_data[idx]
+    q_ref = q_history[idx]
+    q_pred = q_src
+    T_rel_error = relative_error(T_pred, T_ref)
+    q_rel_error = relative_error(q_pred[None, :, :], q_ref)
+
+    T_vmin = float(min(np.min(T_pred), np.min(T_ref)))
+    T_vmax = float(max(np.max(T_pred), np.max(T_ref)))
+    q_vmin = float(min(np.min(q_pred), np.min(q_ref)))
+    q_vmax = float(max(np.max(q_pred), np.max(q_ref)))
+    T_err_abs = float(np.max(np.abs(T_rel_error)))
+
+    fig, axes = plt.subplots(2, 3, figsize=(10, 6), dpi=180)
+    ims = [
+        axes[0, 0].imshow(T_pred[0], origin="lower", cmap="inferno", vmin=T_vmin, vmax=T_vmax),
+        axes[0, 1].imshow(T_ref[0], origin="lower", cmap="inferno", vmin=T_vmin, vmax=T_vmax),
+        axes[0, 2].imshow(T_rel_error[0], origin="lower", cmap="coolwarm", vmin=-T_err_abs, vmax=T_err_abs),
+        axes[1, 0].imshow(q_pred, origin="lower", cmap="coolwarm", vmin=q_vmin, vmax=q_vmax),
+        axes[1, 1].imshow(q_ref[0], origin="lower", cmap="coolwarm", vmin=q_vmin, vmax=q_vmax),
+        axes[1, 2].imshow(q_rel_error[0], origin="lower", cmap="coolwarm", vmin=-Q_REL_ERROR_ABS_LIMIT, vmax=Q_REL_ERROR_ABS_LIMIT),
+    ]
+    titles = [
+        "T pred",
+        "T ground truth",
+        "T relative error",
+        "q pred steady",
+        "q ground truth transient",
+        "q relative error",
+    ]
+    for axis, im, title in zip(axes.flat, ims, titles):
+        fig.colorbar(im, ax=axis, fraction=0.046)
+        axis.set_title(title)
+
+    def update(i):
+        ims[0].set_data(T_pred[i])
+        ims[1].set_data(T_ref[i])
+        ims[2].set_data(T_rel_error[i])
+        ims[4].set_data(q_ref[i])
+        ims[5].set_data(q_rel_error[i])
+        fig.suptitle(f"T and q reconstruction, t={t_data[idx[i]]:.1f}s")
+        return ims
+
+    update(0)
+    fig.tight_layout()
+    ani = animation.FuncAnimation(fig, update, frames=len(idx), blit=False)
+    ani.save(path, writer=animation.PillowWriter(fps=animation_fps(len(idx), max_seconds)))
+    plt.close(fig)
+
+
+def save_temperature_rmse_by_timestep(out_dir, pred, T_data, t_data):
+    field_rmse = np.sqrt(np.mean((pred - T_data) ** 2, axis=(1, 2)))
+    timesteps = np.arange(len(field_rmse))
+    np.savetxt(
+        os.path.join(out_dir, "temperature_field_rmse_by_timestep.csv"),
+        np.column_stack([timesteps, t_data, field_rmse]),
+        delimiter=",",
+        header="timestep,time_s,field_temperature_rmse_C",
+        comments="",
+    )
+
+    fig, ax = plt.subplots(figsize=(6, 3.5), dpi=180)
+    ax.plot(t_data, field_rmse, marker="o", markersize=2.5, linewidth=1.25)
+    ax.set_xlabel("Fitted timestep time (s)")
+    ax.set_ylabel("Field temperature RMSE (C)")
+    ax.set_title("Mean field temperature RMSE by fitted timestep")
+    ax.grid(True, alpha=0.25)
+    fig.tight_layout()
+    fig.savefig(os.path.join(out_dir, "temperature_field_rmse_by_timestep.png"))
+    plt.close(fig)
+
+
 def save_outputs(
     out_dir,
     q_src,
@@ -473,6 +605,7 @@ def save_outputs(
         header="epoch,h",
         comments="",
     )
+    save_temperature_rmse_by_timestep(out_dir, pred, T_data, t_data)
 
     fig, ax = plt.subplots(figsize=(5, 4), dpi=180)
     im = ax.imshow(q_src, origin="lower", cmap="coolwarm")
@@ -522,21 +655,41 @@ def save_outputs(
         fig.savefig(os.path.join(out_dir, "q_ground_truth_metrics.png"))
         plt.close(fig)
 
-    fig, axes = plt.subplots(1, 3, figsize=(10, 3), dpi=180)
-    vmin = min(float(T_data[-1].min()), float(pred[-1].min()))
-    vmax = max(float(T_data[-1].max()), float(pred[-1].max()))
-    for axis, image, title in zip(
-        axes,
-        [T_data[-1], pred[-1], pred[-1] - T_data[-1]],
-        [f"Measured T, t={t_data[-1]:.1f}s", "Predicted T", "Residual"],
-    ):
-        limits = {"vmin": vmin, "vmax": vmax} if title != "Residual" else {}
-        im = axis.imshow(image, origin="lower", cmap="inferno", **limits)
-        fig.colorbar(im, ax=axis, fraction=0.046)
-        axis.set_title(title)
-    fig.tight_layout()
-    fig.savefig(os.path.join(out_dir, "inverse_fit_final_frame.png"))
-    plt.close(fig)
+    if q_history is not None:
+        save_final_comparison(
+            os.path.join(out_dir, "inverse_fit_final_frame.png"),
+            q_src,
+            pred,
+            T_data,
+            t_data,
+            q_history,
+        )
+        save_time_comparison_animation(
+            os.path.join(out_dir, "inverse_fit_over_time.gif"),
+            q_src,
+            pred,
+            T_data,
+            t_data,
+            q_history,
+            max_seconds=animation_seconds,
+            max_frames=animation_max_frames,
+        )
+    else:
+        fig, axes = plt.subplots(1, 3, figsize=(10, 3), dpi=180)
+        vmin = min(float(T_data[-1].min()), float(pred[-1].min()))
+        vmax = max(float(T_data[-1].max()), float(pred[-1].max()))
+        for axis, image, title in zip(
+            axes,
+            [T_data[-1], pred[-1], pred[-1] - T_data[-1]],
+            [f"Measured T, t={t_data[-1]:.1f}s", "Predicted T", "Residual"],
+        ):
+            limits = {"vmin": vmin, "vmax": vmax} if title != "Residual" else {}
+            im = axis.imshow(image, origin="lower", cmap="inferno", **limits)
+            fig.colorbar(im, ax=axis, fraction=0.046)
+            axis.set_title(title)
+        fig.tight_layout()
+        fig.savefig(os.path.join(out_dir, "inverse_fit_final_frame.png"))
+        plt.close(fig)
 
     save_temperature_comparison_animation(
         os.path.join(out_dir, "temperature_reconstruction_comparison.gif"),
@@ -645,19 +798,50 @@ def main():
     parser.add_argument("--animation-seconds", type=float, default=4.5)
     parser.add_argument("--animation-max-frames", type=int, default=120)
     parser.add_argument("--smooth-weight", type=float, default=1e-4)
-    parser.add_argument("--initial-h", type=float, default=0.0)
-    parser.add_argument("--h-lr", type=float, default=1e-6)
-    parser.add_argument("--max-h", type=float, default=1e-3)
-    parser.add_argument("--h-ground-truth", type=float, default=None)
-    parser.add_argument("--no-infer-h", action="store_true")
+    parser.add_argument(
+        "--skip-minutes",
+        type=float,
+        default=0.0,
+        help="Skip this many minutes from the start of the usable dataset before fitting.",
+    )
+    parser.add_argument(
+        "--fixed-h",
+        type=float,
+        default=None,
+        help="Fixed convective coefficient. Defaults to the value stored in dataset params.",
+    )
+    parser.add_argument(
+        "--h-ground-truth",
+        type=float,
+        default=None,
+        help="Alias for --fixed-h when --fixed-h is omitted.",
+    )
+    parser.add_argument("--initial-h", type=float, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--h-lr", type=float, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--max-h", type=float, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--no-infer-h", action="store_true", help=argparse.SUPPRESS)
     args_cli = parser.parse_args()
     viz_every = args_cli.viz_every or args_cli.log_every
 
     load_start = time.perf_counter()
-    T_data, t_data, x, y, q_history, params = load_dataset(args_cli.dataset)
+    T_data, t_data, x, y, q_history, params = load_dataset(
+        args_cli.dataset,
+        skip_minutes=args_cli.skip_minutes,
+    )
     load_seconds = time.perf_counter() - load_start
     args = make_args(T_data, t_data, x, y, params)
-    h_ground_truth = metadata_h_ground_truth(params, args_cli.h_ground_truth)
+    fixed_h = args_cli.fixed_h
+    if fixed_h is None:
+        fixed_h = metadata_h_ground_truth(params, args_cli.h_ground_truth)
+    if fixed_h is None and args_cli.initial_h is not None:
+        fixed_h = args_cli.initial_h
+    if fixed_h is None:
+        raise ValueError(
+            "No convective coefficient found in dataset params. "
+            "Pass --fixed-h or add one of h, h_gt, h_conv, h_coeff, h_coefficient, h0."
+        )
+    args["h"] = fixed_h
+    h_ground_truth = fixed_h
 
     print("Arguments:")
     for key, value in args.items():
@@ -672,10 +856,7 @@ def main():
         args_cli.log_every,
         viz_every,
         args_cli.smooth_weight,
-        not args_cli.no_infer_h,
-        args_cli.initial_h,
-        args_cli.h_lr,
-        args_cli.max_h,
+        fixed_h,
         q_history,
     )
     save_start = time.perf_counter()
