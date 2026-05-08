@@ -1,6 +1,7 @@
 import argparse
 import os
 import time
+from functools import partial
 
 os.environ.setdefault("MPLCONFIGDIR", f"/tmp/matplotlib-{os.getuid()}")
 os.makedirs(os.environ["MPLCONFIGDIR"], exist_ok=True)
@@ -24,6 +25,7 @@ import optax
 
 
 dtype = jnp.float32
+DIFFUSION_STABILITY_SAFETY = 0.1
 try:
     device = jax.devices("cuda")[0]
 except RuntimeError:
@@ -138,13 +140,30 @@ def make_args(T, t, x, y, params):
     }
 
 
-@jax.jit
-def forward_solve(y0, q_src, h, dts, args):
-    def step(T, dt):
-        T_next = T + dt * rhs(T, q_src, h, args)
-        return T_next, T_next
+def diffusion_stability_dt(args, safety=DIFFUSION_STABILITY_SAFETY):
+    rate = 2.0 * args["D_T"] * (1.0 / args["dx"] ** 2 + 1.0 / args["dy"] ** 2)
+    if rate <= 0.0:
+        return np.inf
+    return safety / rate
 
-    _, ys = jax.lax.scan(step, y0, dts)
+
+@partial(jax.jit, static_argnames=("max_substeps",))
+def forward_solve(y0, q_src, h, dts, dt_max, args, max_substeps=1):
+    substep_indices = jnp.arange(max_substeps)
+
+    def step_observed_interval(T, dt):
+        substeps = jnp.maximum(1, jnp.ceil(dt / dt_max).astype(jnp.int32))
+        sub_dt = dt / substeps
+
+        def step_internal(T_inner, substep_idx):
+            T_next = T_inner + sub_dt * rhs(T_inner, q_src, h, args)
+            T_inner = jnp.where(substep_idx < substeps, T_next, T_inner)
+            return T_inner, None
+
+        T, _ = jax.lax.scan(step_internal, T, substep_indices)
+        return T, T
+
+    _, ys = jax.lax.scan(step_observed_interval, y0, dts)
     return jnp.concatenate([y0[None, :, :], ys], axis=0)
 
 
@@ -178,6 +197,10 @@ def inverse_solve(
     if q_history is not None:
         q_ref = jax.device_put(jnp.asarray(np.mean(q_history, axis=0), dtype=dtype), device)
 
+    dt_values = np.diff(t_data)
+    max_stable_dt = diffusion_stability_dt(args)
+    max_substeps = max(1, int(np.ceil(float(np.max(dt_values)) / max_stable_dt)))
+
     h_fixed = jnp.asarray(fixed_h, dtype=dtype)
     params_opt = {"q_src": jnp.zeros_like(T_obs[0])}
     optimizer = optax.adam(lr)
@@ -185,7 +208,15 @@ def inverse_solve(
 
     @jax.jit
     def loss_fn(params):
-        pred = forward_solve(T_obs[0], params["q_src"], h_fixed, dts, args)
+        pred = forward_solve(
+            T_obs[0],
+            params["q_src"],
+            h_fixed,
+            dts,
+            jnp.asarray(max_stable_dt, dtype=dtype),
+            args,
+            max_substeps=max_substeps,
+        )
         data_loss = jnp.mean((pred - T_obs) ** 2)
         q = params["q_src"]
         smooth = jnp.mean((q[1:, :] - q[:-1, :]) ** 2) + jnp.mean((q[:, 1:] - q[:, :-1]) ** 2)
@@ -209,6 +240,12 @@ def inverse_solve(
     print(f"Using device: {device}")
     print(f"Fitting {T_obs.shape[0]} frames on a {T_obs.shape[1]}x{T_obs.shape[2]} grid")
     print(f"Using fixed h {float(h_fixed):.6e}; optimizer is only learning q_src(x, y)")
+    if max_substeps > 1:
+        print(
+            f"Limiting internal forward dt to {max_stable_dt:.6f}s; "
+            f"observed dt range [{float(np.min(dt_values)):.6f}, {float(np.max(dt_values)):.6f}]s "
+            f"uses up to {max_substeps} substeps per training interval"
+        )
     if q_ref is not None:
         print("q_history diagnostics use the time-mean ground truth and are not used by the optimizer")
     for epoch in range(1, epochs + 1):
@@ -789,8 +826,9 @@ def save_outputs(
 def main():
     total_start = time.perf_counter()
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset", default="datasets/ulcer_dataset_01.mat")
-    parser.add_argument("--out-dir", default="outputs/ulcer_dataset_01_inverse")
+    parser.add_argument("--dataset-idx", type=int, default=0)
+    parser.add_argument("--dataset", default=None)
+    parser.add_argument("--out-dir", default=None)
     parser.add_argument("--epochs", type=int, default=1000)
     parser.add_argument("--lr", type=float, default=0.1)
     parser.add_argument("--log-every", type=int, default=25)
@@ -813,7 +851,7 @@ def main():
     parser.add_argument(
         "--h-ground-truth",
         type=float,
-        default=None,
+        default=2.2e-6,
         help="Alias for --fixed-h when --fixed-h is omitted.",
     )
     parser.add_argument("--initial-h", type=float, default=None, help=argparse.SUPPRESS)
@@ -822,6 +860,11 @@ def main():
     parser.add_argument("--no-infer-h", action="store_true", help=argparse.SUPPRESS)
     args_cli = parser.parse_args()
     viz_every = args_cli.viz_every or args_cli.log_every
+    if args_cli.out_dir is None:
+        args_cli.out_dir = f"outputs/ulcer_dataset_{args_cli.dataset_idx:02d}_inverse"
+        args_cli.dataset = f"datasets/ulcer_dataset_{args_cli.dataset_idx:02d}.mat"
+    if args_cli.dataset is None:
+        raise ValueError("--dataset is required")
 
     load_start = time.perf_counter()
     T_data, t_data, x, y, q_history, params = load_dataset(
